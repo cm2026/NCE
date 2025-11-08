@@ -202,6 +202,11 @@ class ParticleBackground {
 
         this.ctx.save();
 
+        // 添加模糊滤镜使光晕过渡更平滑
+        if (!document.body.classList.contains('low-performance')) {
+            this.ctx.filter = 'blur(3px)';
+        }
+
         // 外层超大光晕
         const outerGlowGradient = this.ctx.createRadialGradient(
             particle.x, particle.y, 0,
@@ -236,25 +241,27 @@ class ParticleBackground {
         this.ctx.arc(particle.x, particle.y, currentRadius * 10, 0, Math.PI * 2);
         this.ctx.fill();
 
+        this.ctx.filter = 'none';
+
         // 核心发光体（只在性能足够时使用shadowBlur）
         if (!document.body.classList.contains('low-performance')) {
-            this.ctx.shadowBlur = 30;
-            this.ctx.shadowColor = `rgba(${r},${g},${b},${opacity})`;
+            this.ctx.shadowBlur = 25;
+            this.ctx.shadowColor = `rgba(${r},${g},${b},${opacity * 0.6})`;
         }
-        this.ctx.globalAlpha = opacity;
+        this.ctx.globalAlpha = opacity * 0.7;
         this.ctx.fillStyle = particle.hex;
         this.ctx.beginPath();
-        this.ctx.arc(particle.x, particle.y, currentRadius * 2, 0, Math.PI * 2);
+        this.ctx.arc(particle.x, particle.y, currentRadius * 1.5, 0, Math.PI * 2);
         this.ctx.fill();
 
         // 超亮核心点
         if (!document.body.classList.contains('low-performance')) {
-            this.ctx.shadowBlur = 20;
+            this.ctx.shadowBlur = 15;
         }
         this.ctx.fillStyle = '#FFFFFF';
-        this.ctx.globalAlpha = opacity * 0.8;
+        this.ctx.globalAlpha = opacity * 0.4;
         this.ctx.beginPath();
-        this.ctx.arc(particle.x, particle.y, currentRadius * 0.5, 0, Math.PI * 2);
+        this.ctx.arc(particle.x, particle.y, currentRadius * 0.3, 0, Math.PI * 2);
         this.ctx.fill();
 
         this.ctx.restore();
