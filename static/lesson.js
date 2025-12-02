@@ -145,6 +145,55 @@
         audio.src = mp3Src;
         bookImgEl.src = bookImgSrc;
         bookImgEl.alt = isCustomLesson ? (customBookDisplayName || customBookName) : defaultBookToken;
+        
+        // Disable content interaction until audio is ready
+        content.style.pointerEvents = 'none';
+        content.style.opacity = '0.5';
+        
+        // Monitor audio loading and state changes
+        let stalledCount = 0;
+        let lastStalledTime = 0;
+        
+        audio.addEventListener('loadstart', () => console.log('[AUDIO] loadstart - readyState:', audio.readyState));
+        audio.addEventListener('loadedmetadata', () => console.log('[AUDIO] loadedmetadata - readyState:', audio.readyState, 'duration:', audio.duration));
+        audio.addEventListener('loadeddata', () => console.log('[AUDIO] loadeddata - readyState:', audio.readyState));
+        let audioReady = false;
+        audio.addEventListener('canplay', () => {
+            console.log('[AUDIO] canplay - readyState:', audio.readyState);
+            stalledCount = 0; // Reset stalled counter on successful load
+            if (audio.readyState >= 3) { // HAVE_FUTURE_DATA or better
+                audioReady = true;
+                // Enable UI
+                content.style.pointerEvents = '';
+                content.style.opacity = '';
+            }
+        });
+        audio.addEventListener('canplaythrough', () => console.log('[AUDIO] canplaythrough - readyState:', audio.readyState));
+        audio.addEventListener('stalled', () => {
+            const now = Date.now();
+            stalledCount++;
+            console.warn('[AUDIO] stalled - readyState:', audio.readyState, 'count:', stalledCount);
+            
+            // If stalled multiple times in short period, force reload
+            if (stalledCount >= 2 && now - lastStalledTime < 5000) {
+                console.error('[AUDIO] Multiple stalls detected, forcing reload');
+                const currentTime = audio.currentTime;
+                const wasPaused = audio.paused;
+                audio.load();
+                // Restore position after load
+                audio.addEventListener('loadedmetadata', function restorePosition() {
+                    audio.removeEventListener('loadedmetadata', restorePosition);
+                    audio.currentTime = currentTime;
+                    if (!wasPaused) {
+                        audio.play().catch(e => console.error('[AUDIO] Play after reload failed:', e));
+                    }
+                }, { once: true });
+                stalledCount = 0;
+            }
+            lastStalledTime = now;
+        });
+        audio.addEventListener('suspend', () => console.warn('[AUDIO] suspend - readyState:', audio.readyState));
+        audio.addEventListener('error', (e) => console.error('[AUDIO] Error loading:', audio.error, 'readyState:', audio.readyState));
 
         const displayModesContainer = document.getElementById('display-modes');
         const DISPLAY_MODE_EVENT = 'nce:displayModeAvailability';
@@ -168,12 +217,21 @@
         }
 
         function updateHighlightForTime(time, options = {}) {
+            const { updateSegmentEnd = false } = options;
             const idx = findSentenceIndexAtTime(time);
-            if (idx === -1) return;
+            if (idx === -1) {
+                // If no sentence found at this time, clear segmentEnd to prevent loop-back
+                state.segmentEnd = 0;
+                return;
+            }
             highlight(idx, options);
-            const sentence = state.data[idx];
-            if (sentence) {
-                state.segmentEnd = sentence.end;
+            // Only update segmentEnd if explicitly requested
+            // This prevents manual seeks from being overridden by playback logic
+            if (updateSegmentEnd) {
+                const sentence = state.data[idx];
+                if (sentence) {
+                    state.segmentEnd = sentence.end;
+                }
             }
         }
 
@@ -430,7 +488,89 @@
                 if (!lrcRes.ok) {
                     throw new Error(`Failed to load LRC: ${lrcRes.status}`);
                 }
-                const text = await lrcRes.text();
+                
+                // Read as ArrayBuffer to handle different encodings
+                const buffer = await lrcRes.arrayBuffer();
+                let text = '';
+                
+                // Try to decode with different encodings
+                // Order matters: try most common encodings first
+                const encodings = [
+                    'utf-8',
+                    'gbk',           // Simplified Chinese
+                    'gb2312',        // Simplified Chinese (older)
+                    'big5',          // Traditional Chinese
+                    'windows-1252',  // Western European (ANSI)
+                    'windows-1250',  // Central European (ANSI)
+                    'iso-8859-1',    // Latin-1
+                    'iso-8859-2',    // Latin-2 (Central European)
+                    'shift-jis',     // Japanese
+                    'euc-jp',        // Japanese
+                    'euc-kr',        // Korean
+                    'windows-1251'   // Cyrillic
+                ];
+                let decoded = false;
+                let bestText = '';
+                let bestScore = -1;
+                
+                for (const encoding of encodings) {
+                    try {
+                        const decoder = new TextDecoder(encoding, { fatal: true });
+                        const decodedText = decoder.decode(buffer);
+                        
+                        // Check if the decoded text contains valid LRC format
+                        if (!decodedText.includes('[') || !/\d+:\d+/.test(decodedText)) {
+                            continue;
+                        }
+                        
+                        // Score the decoded text quality
+                        // Higher score = better decoding
+                        let score = 0;
+                        
+                        // Penalty for replacement characters (�)
+                        const replacementChars = (decodedText.match(/�/g) || []).length;
+                        score -= replacementChars * 100;
+                        
+                        // Penalty for invalid Unicode sequences
+                        const invalidChars = (decodedText.match(/[\uFFFD\uFFFE\uFFFF]/g) || []).length;
+                        score -= invalidChars * 100;
+                        
+                        // Bonus for valid CJK characters (Chinese, Japanese, Korean)
+                        const cjkChars = (decodedText.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || []).length;
+                        score += cjkChars * 2;
+                        
+                        // Bonus for valid ASCII printable characters
+                        const asciiChars = (decodedText.match(/[\x20-\x7E]/g) || []).length;
+                        score += asciiChars * 0.5;
+                        
+                        // If this is the best decoding so far, save it
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestText = decodedText;
+                            decoded = true;
+                        }
+                        
+                        // If we have a perfect score (no replacement chars), use it immediately
+                        if (replacementChars === 0 && invalidChars === 0 && score > 0) {
+                            text = decodedText;
+                            decoded = true;
+                            break;
+                        }
+                    } catch (e) {
+                        // Decoding failed with this encoding, try next
+                        continue;
+                    }
+                }
+                
+                // Use the best decoded text if we found one
+                if (decoded && bestText) {
+                    text = bestText;
+                } else {
+                    // Fallback to UTF-8 if no encoding worked
+                    const decoder = new TextDecoder('utf-8', { fatal: false });
+                    text = decoder.decode(buffer);
+                }
+                
                 const lines = text.split(/\r?\n/).filter(Boolean);
 
                 lines.forEach((raw, i) => {
@@ -443,9 +583,16 @@
                     }
 
                     const start = parseTime(`[${match[1]}]`);
-                    const [enRaw, cnRaw = ''] = match[2].split('|');
+                    const contentAfterTimestamp = match[2] || '';
+                    const [enRaw, cnRaw = ''] = contentAfterTimestamp.split('|');
                     const en = (enRaw || '').trim();
                     const cn = (cnRaw || '').trim();
+                    
+                    // Skip empty lines (lines with only timestamp but no text, or only whitespace)
+                    if (!en && !cn) {
+                        return;
+                    }
+                    
                     if (cn) {
                         state.hasTranslation = true;
                     }
@@ -511,10 +658,123 @@
         /** ------------------------------------------------- 
          *  播放区间
          * ------------------------------------------------- */
+        let pendingPlayRequest = null;
+        let lastSeekTime = 0;
+        const SEEK_DEBOUNCE_MS = 300; // 防抖间隔：300ms内的重复seek会被忽略（避免服务器过载）
+        
         function playSegment(start, end) {
-            state.segmentEnd = end
-            audio.currentTime = start;
-            audio.play();
+            // Block if audio not ready yet
+            if (!audioReady) {
+                console.warn('[PLAY] Audio not ready, ignoring request');
+                return;
+            }
+            
+            const now = Date.now();
+            // 防抖：如果距离上次seek太近，先记录位置但延迟执行
+            if (now - lastSeekTime < SEEK_DEBOUNCE_MS) {
+                console.log('[PLAY] Seek too fast, debouncing...');
+                // 取消之前的延迟执行
+                if (pendingPlayRequest && pendingPlayRequest.debounceTimeout) {
+                    clearTimeout(pendingPlayRequest.debounceTimeout);
+                }
+                // 延迟执行
+                const debounceTimeout = setTimeout(() => {
+                    lastSeekTime = Date.now();
+                    executePlaySegment(start, end);
+                }, SEEK_DEBOUNCE_MS);
+                
+                if (pendingPlayRequest) {
+                    pendingPlayRequest.debounceTimeout = debounceTimeout;
+                } else {
+                    pendingPlayRequest = { debounceTimeout };
+                }
+                return;
+            }
+            
+            lastSeekTime = now;
+            executePlaySegment(start, end);
+        }
+        
+        function executePlaySegment(start, end) {
+            console.log('[PLAY] playSegment called - start:', start, 'readyState:', audio.readyState, 'networkState:', audio.networkState);
+            state.segmentEnd = end;
+            
+            // Check if audio is loaded and has valid source
+            if (!audio.src || audio.error) {
+                console.warn('[PLAY] Audio source not ready or has error');
+                return;
+            }
+            
+            // Cancel any pending play request
+            if (pendingPlayRequest) {
+                console.log('[PLAY] Cancelling previous pending request');
+                if (pendingPlayRequest.timeout) {
+                    clearTimeout(pendingPlayRequest.timeout);
+                }
+                if (pendingPlayRequest.handler) {
+                    audio.removeEventListener('canplay', pendingPlayRequest.handler);
+                }
+                if (pendingPlayRequest.errorHandler) {
+                    audio.removeEventListener('error', pendingPlayRequest.errorHandler);
+                }
+                pendingPlayRequest = null;
+            }
+            
+            // Always try to seek, even if readyState is low
+            // This handles the case where rapid seeks cause readyState to drop
+            console.log('[PLAY] Seeking to:', start);
+            
+            try {
+                audio.currentTime = start;
+            } catch (e) {
+                console.error('[PLAY] Failed to set currentTime:', e);
+                return;
+            }
+            
+            // If audio is ready enough to play, play immediately
+            if (audio.readyState >= 2) {
+                console.log('[PLAY] Audio ready (readyState >= 2), playing now');
+                audio.play().catch(e => {
+                    console.error('[PLAY] Play failed:', e);
+                });
+            } else {
+                // Audio needs more data, wait for canplay
+                console.log('[PLAY] Audio needs more data (readyState:', audio.readyState, '), waiting for canplay...');
+                
+                const onCanPlay = () => {
+                    console.log('[PLAY] canplay event fired, playing now');
+                    if (pendingPlayRequest && pendingPlayRequest.handler === onCanPlay) {
+                        pendingPlayRequest = null;
+                    }
+                    audio.play().catch(e => {
+                        console.error('[PLAY] Play failed after canplay:', e);
+                    });
+                };
+                
+                const onError = () => {
+                    console.error('[PLAY] Error event fired during wait');
+                    if (pendingPlayRequest && pendingPlayRequest.errorHandler === onError) {
+                        pendingPlayRequest = null;
+                    }
+                };
+                
+                // Set timeout in case canplay never fires
+                const timeout = setTimeout(() => {
+                    console.error('[PLAY] Timeout waiting for canplay - readyState:', audio.readyState, 'networkState:', audio.networkState);
+                    audio.removeEventListener('canplay', onCanPlay);
+                    audio.removeEventListener('error', onError);
+                    pendingPlayRequest = null;
+                    // Force play attempt even if not ready
+                    audio.play().catch(e => {
+                        console.error('[PLAY] Forced play after timeout also failed:', e);
+                    });
+                }, 3000);
+                
+                pendingPlayRequest = { handler: onCanPlay, errorHandler: onError, timeout };
+                
+                audio.addEventListener('canplay', onCanPlay, { once: true });
+                audio.addEventListener('error', onError, { once: true });
+            }
         }
 
         /** ------------------------------------------------- 
@@ -634,12 +894,26 @@
             if (!width || !duration || Number.isNaN(duration)) {
                 return;
             }
+            
+            // Check if audio is ready
+            if (audio.readyState < 2 || audio.error) {
+                console.warn('Audio not ready for seeking');
+                return;
+            }
+            
             const targetTime = (clickX / width) * duration;
+            // Clear segmentEnd to prevent immediate loop back
+            state.segmentEnd = 0;
             audio.currentTime = targetTime;
-            updateHighlightForTime(targetTime, { force: true });
+            updateHighlightForTime(targetTime, { force: true, updateSegmentEnd: false });
         });
 
         progressBar.addEventListener('pointerdown', e => {
+            // Check if audio is ready before allowing drag
+            if (audio.readyState < 2 || audio.error) {
+                return;
+            }
+            
             if (e.pointerType === 'touch') {
                 e.preventDefault();
             }
@@ -660,7 +934,7 @@
                 }
             }
             pendingSeekTime = targetTime;
-            updateHighlightForTime(targetTime, { force: true });
+            updateHighlightForTime(targetTime, { force: true, updateSegmentEnd: false });
         });
 
         progressBar.addEventListener('pointermove', e => {
@@ -673,7 +947,7 @@
                 return;
             }
             pendingSeekTime = targetTime;
-            updateHighlightForTime(targetTime, { force: true });
+            updateHighlightForTime(targetTime, { force: true, updateSegmentEnd: false });
         });
 
         function finalizeSeek(e) {
@@ -687,6 +961,8 @@
                 }
             }
             if (pendingSeekTime !== null) {
+                // Clear segmentEnd BEFORE setting currentTime to prevent immediate loop back
+                state.segmentEnd = 0;
                 audio.currentTime = pendingSeekTime;
             }
             if (wasPlayingBeforeDrag) {
@@ -731,6 +1007,7 @@
             if (!target) return;
             const idx = Number(target.dataset.idx);
             const {start, end} = state.data[idx];
+            console.log('[CLICK] Sentence clicked - readyState:', audio.readyState, 'networkState:', audio.networkState, 'error:', audio.error);
             playSegment(start, end);
         });
 
@@ -950,10 +1227,15 @@
             const cur = audio.currentTime;
             const duration = audio.duration;
 
-            // Update progress bar and time display
-            if (duration) {
+            // Update progress bar and time display (skip if dragging to avoid flickering)
+            if (duration && !isDraggingProgress) {
                 progress.style.width = `${(cur / duration) * 100}%`;
                 timeDisplay.textContent = `${formatTime(cur)} / ${formatTime(duration)}`;
+            }
+
+            // Skip all playback logic while dragging
+            if (isDraggingProgress) {
+                return;
             }
 
             // A-B Loop logic
@@ -995,7 +1277,16 @@
 
             // Find and highlight current sentence
             const idx = findSentenceIndexAtTime(cur);
-            if (idx !== -1) highlight(idx);
+            if (idx !== -1) {
+                highlight(idx);
+                // Update segmentEnd for the current sentence if not already set
+                if (!state.segmentEnd && state.data[idx]) {
+                    state.segmentEnd = state.data[idx].end;
+                }
+            } else {
+                // No sentence at current time - clear segmentEnd to prevent issues
+                state.segmentEnd = 0;
+            }
         });
 
         function loadSettings() {
@@ -1127,7 +1418,7 @@
         // 初始化
         loadSettings();
         loadLrc().then(r => {
-            //console.log("LRC Data:", JSON.stringify(state.data, null, 2));
+            // LRC loaded successfully
         });
 
         // Lesson navigation functionality
