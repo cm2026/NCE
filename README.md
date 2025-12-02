@@ -108,6 +108,61 @@
 
 ---
 
+## 本地服务器（用于自定义课程）
+
+如果你想使用本地的 MP3 和 LRC 文件创建自定义课程，可以使用内置的本地 HTTP 服务器。
+
+### 快速开始
+
+#### Windows 用户
+1. 将你的 MP3 和 LRC 文件放在项目目录下（或任意子文件夹）
+2. 双击运行 `run_server.bat`
+3. 服务器将在 `http://localhost:8082` 启动
+
+#### 其他系统用户
+```bash
+python http_server.py
+```
+
+### 使用说明
+
+1. **启动服务器**后，你会看到如下提示：
+   ```
+   正在启动服务器...
+   根目录: D:\Workspace\NCE
+   地  址: http://localhost:8082
+   ```
+
+2. **在主页面添加自定义课程**：
+   - 访问网站主页，点击"自定义课本"
+   - 输入 JSON 格式的课程数据，例如：
+     ```json
+     {
+       "我的课程": [
+         {
+           "title": "第一课",
+           "filename": "http://localhost:8082/lesson1.mp3",
+           "lrc": "http://localhost:8082/lesson1.lrc"
+         }
+       ]
+     }
+     ```
+
+3. **重要提示**：
+   - URL 路径直接使用相对项目根目录的路径
+   - 如果 LRC 文件与 MP3 文件同名且在同一目录，可以省略 `lrc` 字段，系统会自动查找
+   - 支持多种编码的 LRC 文件（UTF-8、GBK、GB2312、Big5）
+   - 需要在浏览器中允许混合内容（Mixed Content），因为 GitHub Pages 使用 HTTPS，而本地服务器是 HTTP
+
+### 端口修改
+
+如果 8082 端口被占用，可以编辑 `http_server.py` 文件，修改 `PORT` 变量：
+```python
+PORT = 8082  # 改为其他端口号
+```
+
+---
+
 ## 派生与修改
 
 本派生项目源于 [iChochy/NCE](https://github.com/iChochy/NCE).
